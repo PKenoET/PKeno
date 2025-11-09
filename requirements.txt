@@ -1,11 +1,1 @@
-sqlmodel==0.0.20
-fastapi
-python-telegram-bot==21.0
-uvicorn
-httpx
-asyncpg
-psycopg2-binary
-python-dotenv
-
-
-
+[Immersive content redacted for brevity.]
