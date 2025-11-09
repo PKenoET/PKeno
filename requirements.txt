@@ -1,7 +1,1 @@
-fastapi
-uvicorn
-python-telegram-bot
-sqlmodel==0.0.16
-python-dotenv
-httpx
-psycopg[binary]
+[Immersive content redacted for brevity.]
