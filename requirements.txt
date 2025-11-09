@@ -1,20 +1,7 @@
-FastAPI and utilities
-
 fastapi
 uvicorn[standard]
-pydantic
-python-dotenv # For local development
-
-Telegram Bot Library (PTB)
-
-python-telegram-bot[asyncio]>=21.0
-
-Database (PostgreSQL)
-
-sqlmodel>=0.0.18
-psycopg[binary]
+python-telegram-bot
+sqlmodel
 asyncpg
-
-Cache/Distributed State (Redis)
-
-redis
+python-dotenv
+httpx
