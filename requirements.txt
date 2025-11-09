@@ -1,4 +1,4 @@
-sqlmodel==0.0.16
+sqlmodel==0.10.0
 fastapi
 python-telegram-bot==21.0
 uvicorn
@@ -6,4 +6,5 @@ httpx
 asyncpg
 psycopg2-binary
 python-dotenv
+
 
