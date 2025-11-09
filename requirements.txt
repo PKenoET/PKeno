@@ -1,1 +1,8 @@
-[Immersive content redacted for brevity.]
+sqlmodel==0.0.16
+fastapi
+python-telegram-bot==20.9
+uvicorn
+httpx
+asyncpg
+psycopg2-binary
+python-dotenv
