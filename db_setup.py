@@ -8,7 +8,7 @@ import json
 
 # --- Database Configuration ---
 # NOTE: In deployment (Railway), this URL is automatically provided via the DATABASE_URL environment variable.
-DATABASE_URL = "postgresql+psycopg://postgres:password@localhost/keno_db"
+DATABASE_URL = "postgresql+asyncpg://postgres:password@localhost/keno_db"
 
 # --- Models ---
 
@@ -139,3 +139,4 @@ if __name__ == "__main__":
     else:
 
         print("Please set the DATABASE_URL environment variable.")
+
