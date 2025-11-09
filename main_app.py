@@ -10,12 +10,12 @@ from typing import Dict, List, Optional
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
 from telegram import Update, Message
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from telegram.constants import ParseMode
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
-from sqlmodel import select
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from sqlmodel import select, SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
-from redis import asyncio as aioredis
+# from redis import asyncio as aioredis  <-- REMOVED REDIS IMPORT
 from dotenv import load_dotenv
 
 # Local imports
@@ -23,13 +23,13 @@ from db_setup import init_db, create_db_and_tables, engine, User, Transaction, K
 
 # --- Configuration & Initialization ---
 
-load_dotenv() # Load .env file for local development
+load_dotenv()
 
 # Environment Variables (CRITICAL for deployment)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-FASTAPI_PUBLIC_URL = os.getenv("FASTAPI_PUBLIC_URL") # e.g., https://your-railway-domain.up.railway.app
+FASTAPI_PUBLIC_URL = os.getenv("FASTAPI_PUBLIC_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
-REDIS_URL = os.getenv("REDIS_URL")
+# REDIS_URL = os.getenv("REDIS_URL") <-- REDIS URL IS NO LONGER NEEDED
 
 # Game Constants
 GAME_INTERVAL_SECONDS = 60 # Time between draws
@@ -43,11 +43,16 @@ ADMIN_ID = 557555000 # Placeholder: Replace with your actual Telegram User ID
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Global State & Cache ---
-# The game state is stored in Redis for distributed/persistent management
-redis_client: Optional[aioredis.Redis] = None
+# --- Global State (In-memory Fallback for Round Tracking) ---
+# NOTE: In a single-instance deployment (like the Render free tier), this is fine.
+# If you scale to multiple instances, this state will not be shared.
+class GameState:
+    current_round_id: int = 1
+    next_draw_time: datetime = datetime.utcnow() + timedelta(seconds=GAME_INTERVAL_SECONDS)
+
+GAME_STATE = GameState()
 game_task: Optional[asyncio.Task] = None
-game_loop_lock = asyncio.Lock() # Internal lock for game loop control
+game_loop_lock = asyncio.Lock()
 
 # --- Utility Functions ---
 
@@ -65,14 +70,12 @@ async def get_or_create_user(session: AsyncSession, tg_id: int, username: str) -
     user = result.first()
     
     if not user:
-        # Create a new user with default balances
         user = User(telegram_id=tg_id, username=username, vault_balance=0.0, playground_balance=0.0)
         session.add(user)
         await session.commit()
         await session.refresh(user)
         logger.info(f"New user created: {tg_id}")
 
-        # Make the defined ADMIN_ID an admin upon creation
         if tg_id == ADMIN_ID:
              user.is_admin = True
              session.add(user)
@@ -82,41 +85,39 @@ async def get_or_create_user(session: AsyncSession, tg_id: int, username: str) -
     
     return user
 
+async def initialize_game_state(session: AsyncSession):
+    """Initializes GAME_STATE from the database on startup."""
+    global GAME_STATE
+    # Find the latest round ID
+    latest_round_statement = select(KenoRound).order_by(KenoRound.round_id.desc()).limit(1)
+    latest_round = (await session.exec(latest_round_statement)).first()
+    
+    if latest_round:
+        GAME_STATE.current_round_id = latest_round.round_id
+    else:
+        GAME_STATE.current_round_id = 1
+        
+    # Set the next draw time based on the last known round or default interval
+    GAME_STATE.next_draw_time = datetime.utcnow() + timedelta(seconds=GAME_INTERVAL_SECONDS)
+    logger.info(f"Game State Initialized. Current Round: {GAME_STATE.current_round_id}")
+
+
 async def get_current_round_id() -> int:
-    """Fetches the current active round ID from Redis."""
-    if redis_client:
-        round_id = await redis_client.get('current_round_id')
-        return int(round_id) if round_id else 1
-    return 1 # Fallback to 1 if Redis is unavailable
+    """Fetches the current active round ID from in-memory state."""
+    return GAME_STATE.current_round_id
 
 async def get_next_draw_time() -> datetime:
-    """Fetches the next scheduled draw time from Redis."""
-    if redis_client:
-        draw_time_str = await redis_client.get('next_draw_time')
-        if draw_time_str:
-            return datetime.fromisoformat(draw_time_str.decode())
-    return datetime.utcnow() + timedelta(seconds=GAME_INTERVAL_SECONDS)
+    """Fetches the next scheduled draw time from in-memory state."""
+    return GAME_STATE.next_draw_time
 
 # --- Core Game Logic ---
 
 async def execute_keno_draw(session: AsyncSession, current_round_id: int) -> List[int]:
-    """
-    Simulates the Keno draw and saves the result.
+    """Simulates the Keno draw and saves the result."""
     
-    NOTE: CRITICAL IMPLEMENTATION POINT
-    This is where the complex RTP (Return to Player) algorithm must be implemented.
-    Instead of a pure random draw, a production system would:
-    1. Calculate the current house edge (HE) based on recent bets/payouts.
-    2. Adjust the draw odds to maintain the target HE.
-    
-    For now, this returns a purely random draw (50% RTP expected).
-    """
-    
-    # 1. Simple Random Draw (80 numbers, draw 20)
     winning_numbers = random.sample(range(1, KENO_MAX_NUMBERS + 1), KENO_DRAW_COUNT)
     winning_numbers.sort()
     
-    # 2. Save the round result
     new_round = KenoRound(
         round_id=current_round_id,
         draw_time=datetime.utcnow(),
@@ -128,14 +129,7 @@ async def execute_keno_draw(session: AsyncSession, current_round_id: int) -> Lis
     return winning_numbers
 
 async def settle_all_bets(session: AsyncSession, round_id: int, winning_numbers: List[int], context: ContextTypes.DEFAULT_TYPE):
-    """
-    Calculates the results for all bets in the finished round and pays out winners.
-    
-    NOTE: CRITICAL IMPLEMENTATION POINT
-    The payout structure must be defined and applied here. This is a placeholder
-    for a simple 1:1 payout if 5 or more numbers match out of 10 picks.
-    The real system needs a comprehensive payout table.
-    """
+    """Calculates the results for all bets in the finished round and pays out winners."""
     
     bet_statement = select(Bet).where(Bet.round_id == round_id, Bet.is_settled == False)
     bets = (await session.exec(bet_statement)).all()
@@ -173,7 +167,6 @@ async def settle_all_bets(session: AsyncSession, round_id: int, winning_numbers:
         
         # Create WIN Transaction and update user balance
         if payout_amount > 0:
-            # IMPORTANT: This must be an atomic transaction in a production system.
             user.playground_balance += payout_amount 
             
             win_tx = Transaction(
@@ -189,34 +182,38 @@ async def settle_all_bets(session: AsyncSession, round_id: int, winning_numbers:
         await session.commit()
         await session.refresh(user)
         
-        # Send notification to user
-        if payout_amount > 0:
-            await context.bot.send_message(
-                chat_id=bet.user_id,
-                text=f"🥳 *Round {round_id} Result:* Your bet of {bet.amount:.2f} ETB on {selected_set} matched *{matched_count}* numbers!\n\n"
-                     f"You won: *{payout_amount:.2f} ETB*! Your new Playground balance is {user.playground_balance:.2f} ETB.",
-                parse_mode=ParseMode.MARKDOWN
-            )
-        else:
-            await context.bot.send_message(
-                chat_id=bet.user_id,
-                text=f"😔 *Round {round_id} Result:* Your bet of {bet.amount:.2f} ETB on {selected_set} matched *{matched_count}* numbers. Better luck next time!",
-                parse_mode=ParseMode.MARKDOWN
-            )
+        # Send notification to user (use try-except for sending messages)
+        try:
+            if payout_amount > 0:
+                await context.bot.send_message(
+                    chat_id=bet.user_id,
+                    text=f"🥳 *Round {round_id} Result:* Your bet of {bet.amount:.2f} ETB matched *{matched_count}* numbers!\n\n"
+                         f"You won: *{payout_amount:.2f} ETB*! Your new Playground balance is {user.playground_balance:.2f} ETB.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=bet.user_id,
+                    text=f"😔 *Round {round_id} Result:* Your bet of {bet.amount:.2f} ETB matched *{matched_count}* numbers. Better luck next time!",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+        except Exception as msg_e:
+            logger.error(f"Failed to send settlement message to user {bet.user_id}: {msg_e}")
+
 
 async def start_new_round(session: AsyncSession, context: ContextTypes.DEFAULT_TYPE):
-    """Sets up the next round and informs users."""
+    """Updates in-memory state for the next round and informs users."""
+    global GAME_STATE
     
-    current_round_id = await get_current_round_id()
+    current_round_id = GAME_STATE.current_round_id
     new_round_id = current_round_id + 1
     next_draw_time = datetime.utcnow() + timedelta(seconds=GAME_INTERVAL_SECONDS)
     
-    await redis_client.set('current_round_id', new_round_id)
-    await redis_client.set('next_draw_time', next_draw_time.isoformat())
+    # Update in-memory state
+    GAME_STATE.current_round_id = new_round_id
+    GAME_STATE.next_draw_time = next_draw_time
     
-    # Send broadcast message to all users about the new round
-    # In a real app, this would query active users. Here, we send a general message.
-    
+    # Send broadcast message
     draw_time_str = next_draw_time.strftime("%I:%M:%S %p")
     message = (
         f"🔔 *New Keno Round Started!* (Round ID: {new_round_id})\n\n"
@@ -224,33 +221,30 @@ async def start_new_round(session: AsyncSession, context: ContextTypes.DEFAULT_T
         f"Use /play to pick your numbers."
     )
     
-    # Simplified broadcast - in reality, you'd use a broadcast queue.
-    # For now, we update the main info message or rely on /profile refresh.
     logger.info(f"New round {new_round_id} started. Draw at {draw_time_str}")
     
-    # You might want to update a central 'info' message here for better UX.
 
 async def run_keno_game(context: ContextTypes.DEFAULT_TYPE):
     """The main continuous game loop, running in a background task."""
     logger.info("Keno Game Loop started.")
     
-    # Ensure tables are created on startup (idempotent)
-    await create_db_and_tables() 
-    
+    # Initialization step
+    async for session in get_db_session():
+        await create_db_and_tables() 
+        await initialize_game_state(session)
+        break
+
     while True:
         try:
             now = datetime.utcnow()
-            next_draw_time = await get_next_draw_time()
+            next_draw_time = GAME_STATE.next_draw_time
             
-            # 1. Check if it's time for a draw
             if next_draw_time <= now:
                 
-                # Use a lock to prevent concurrent draws
                 async with game_loop_lock:
-                    current_round_id = await get_current_round_id()
+                    current_round_id = GAME_STATE.current_round_id
                     logger.info(f"--- DRAW TIME HIT for Round {current_round_id} ---")
 
-                    # Execute the draw and settlement inside a single DB session
                     async for session in get_db_session():
                         # A. Execute Draw
                         winning_numbers = await execute_keno_draw(session, current_round_id)
@@ -258,19 +252,19 @@ async def run_keno_game(context: ContextTypes.DEFAULT_TYPE):
                         # B. Settle Bets for the finished round
                         await settle_all_bets(session, current_round_id, winning_numbers, context)
                         
-                        # C. Start the next round
+                        # C. Start the next round (updates in-memory state)
                         await start_new_round(session, context)
                         
-                        break # Exit session loop
+                        break
 
-            # 2. Wait for the next check (e.g., check every 5 seconds)
             await asyncio.sleep(5)
 
         except Exception as e:
             logger.error(f"Error in game loop: {e}", exc_info=True)
-            await asyncio.sleep(10) # Wait longer after an error
+            await asyncio.sleep(10)
 
-# --- Telegram Bot Handlers ---
+# --- Telegram Bot Handlers (No changes needed below this point) ---
+# ... (All other handlers like start_command, profile_command, deposit_command, etc., remain the same) ...
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sends a welcome message and creates the user profile."""
@@ -321,13 +315,10 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text(profile_message, parse_mode=ParseMode.MARKDOWN)
         break
 
-# --- Financial Handlers (Placeholders for complex logic) ---
-
 async def deposit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Initiates a deposit request for Admin approval."""
     tg_id = update.effective_user.id
     
-    # The user must provide the amount in the command (e.g., /deposit 100)
     if not context.args or not context.args[0].isdigit():
         await update.message.reply_text("Please use the format: `/deposit <AMOUNT>`. E.g., `/deposit 500`", parse_mode=ParseMode.MARKDOWN)
         return
@@ -340,7 +331,6 @@ async def deposit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("Invalid amount. Please enter a positive number.")
         return
 
-    # NOTE: This creates a PENDING transaction that requires Admin approval later.
     async for session in get_db_session():
         new_tx = Transaction(
             user_id=tg_id,
@@ -359,7 +349,6 @@ async def deposit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             parse_mode=ParseMode.MARKDOWN
         )
 
-        # Notify Admin (CRITICAL FOR WORKFLOW)
         await context.bot.send_message(
             chat_id=ADMIN_ID,
             text=f"🚨 *NEW PENDING DEPOSIT* (TxID: {new_tx.id})\nUser ID: `{tg_id}` requested: {amount:.2f} ETB. "
@@ -390,14 +379,8 @@ async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await update.message.reply_text("Insufficient funds in your Vault. Use /profile to check your balance.")
             return
 
-        # NOTE: CRITICAL ATOMIC TRANSACTION - FUNDS MUST BE RESERVED.
-        # For simplicity here, we create the transaction and reduce the balance immediately,
-        # but in a production system, this requires a DB transaction isolation level >= repeatable read.
-        
-        # 1. Deduct from Vault (Reservation)
         user.vault_balance -= amount
         
-        # 2. Create PENDING Withdrawal Transaction
         new_tx = Transaction(
             user_id=tg_id,
             amount=amount,
@@ -417,7 +400,6 @@ async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             parse_mode=ParseMode.MARKDOWN
         )
 
-        # Notify Admin
         await context.bot.send_message(
             chat_id=ADMIN_ID,
             text=f"🚨 *NEW PENDING WITHDRAWAL* (TxID: {new_tx.id})\nUser ID: `{tg_id}` requested: {amount:.2f} ETB. "
@@ -430,7 +412,6 @@ async def transfer_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     """Handles fund transfers between Vault and Playground."""
     tg_id = update.effective_user.id
     
-    # Expected format: /transfer <AMOUNT> <FROM_WALLET>
     if len(context.args) != 2:
         await update.message.reply_text(
             "Please use the format: `/transfer <AMOUNT> <vault|play>`. "
@@ -454,7 +435,6 @@ async def transfer_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await update.message.reply_text("User not found. Please /start.")
             return
 
-        # CRITICAL: Start the atomic transfer logic
         try:
             if source == 'vault':
                 if user.vault_balance < amount:
@@ -472,16 +452,13 @@ async def transfer_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 user.vault_balance += amount
                 tx_type_out, tx_type_in = "TRANSFER_OUT", "TRANSFER_IN"
 
-            # 1. Update user balances (in this DB session)
             session.add(user)
             
-            # 2. Log two correlated transactions (Out and In)
             tx_out = Transaction(user_id=tg_id, amount=amount, type=tx_type_out, status="COMPLETED", request_details=f'{{"from": "{source}"}}')
             tx_in = Transaction(user_id=tg_id, amount=amount, type=tx_type_in, status="COMPLETED", request_details=f'{{"to": "{ "play" if source == "vault" else "vault"}"}}')
             session.add(tx_out)
             session.add(tx_in)
             
-            # 3. Commit the atomic change
             await session.commit()
             await session.refresh(user)
             
@@ -492,18 +469,14 @@ async def transfer_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
 
         except Exception as e:
-            # If commit fails, the entire transaction is rolled back (auto-handled by AsyncSession)
             logger.error(f"Transfer failed for user {tg_id}: {e}", exc_info=True)
             await update.message.reply_text("An error occurred during the transfer. Funds were not moved.")
         
         break
 
-# --- Game Interaction Handler ---
-
 async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Starts the number selection process."""
     
-    # 1. Check if the user is registered
     tg_id = update.effective_user.id
     async for session in get_db_session():
         user = (await session.exec(select(User).where(User.telegram_id == tg_id))).first()
@@ -511,16 +484,14 @@ async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await update.message.reply_text(f"Your Playground balance is too low (Min Bet: {MIN_BET_AMOUNT} ETB). Deposit funds or /transfer funds from your Vault.")
             return
         
-        # 2. Check game status
         round_id = await get_current_round_id()
         next_draw = await get_next_draw_time()
         time_left = next_draw - datetime.utcnow()
         
-        if time_left.total_seconds() <= 5: # 5 second cutoff before draw
+        if time_left.total_seconds() <= 5: 
             await update.message.reply_text("Sorry, the betting window for this round is closed. Please wait for the next round to start.")
             return
 
-        # 3. Store temporary state for selection process (Max 10 picks)
         context.user_data['state'] = 'PICKING_NUMBERS'
         context.user_data['picks'] = []
         context.user_data['bet_round_id'] = round_id
@@ -539,11 +510,9 @@ async def handle_picks_and_bet(update: Update, context: ContextTypes.DEFAULT_TYP
     """Handles the user's number submission and final bet confirmation."""
     
     if context.user_data.get('state') != 'PICKING_NUMBERS':
-        # Ignore messages not part of the number picking flow
         return
 
     try:
-        # Parse user's input (space-separated numbers)
         raw_picks = update.message.text.split()
         picks = []
         for p in raw_picks:
@@ -578,7 +547,7 @@ async def handle_picks_and_bet(update: Update, context: ContextTypes.DEFAULT_TYP
 
     except ValueError:
         await update.message.reply_text("Please send valid numbers separated by spaces (e.g., `5 12 77 33`).")
-        context.user_data['state'] = 'PICKING_NUMBERS' # Reset to picking state
+        context.user_data['state'] = 'PICKING_NUMBERS'
         
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -604,35 +573,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             round_id = context.user_data['bet_round_id']
             tg_id = query.from_user.id
             
-            # FINAL ATOMIC BET EXECUTION
             async for session in get_db_session():
                 user = (await session.exec(select(User).where(User.telegram_id == tg_id))).first()
                 
-                # Double check balance
                 if not user or user.playground_balance < amount:
                     await query.edit_message_text("❌ Bet failed: Insufficient Playground balance.")
                     return
 
-                # Check if betting window is still open
                 next_draw = await get_next_draw_time()
                 if (next_draw - datetime.utcnow()).total_seconds() <= 5:
                     await query.edit_message_text("❌ Bet failed: Betting window closed (Draw is too soon).")
                     return
 
-                # --- CRITICAL ATOMIC TRANSACTION: DEDUCT & LOG ---
-                
-                # 1. Deduct from Playground balance
                 user.playground_balance -= amount
                 
-                # 2. Create Bet record
                 new_bet = Bet(
                     user_id=tg_id,
                     round_id=round_id,
                     amount=amount,
-                    selected_numbers=picks # The setter automatically handles JSON serialization
+                    selected_numbers=picks
                 )
                 
-                # 3. Create BET Transaction log
                 bet_tx = Transaction(
                     user_id=tg_id,
                     amount=amount,
@@ -647,11 +608,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await session.commit()
                 await session.refresh(user)
                 
-                # Clear user state
                 context.user_data.pop('state', None)
                 context.user_data.pop('final_picks', None)
                 
-                # Inform user
                 await query.edit_message_text(
                     f"✅ *Bet Placed Successfully!* (Round {round_id})\n"
                     f"Amount: *{amount:.2f} ETB*\n"
@@ -661,7 +620,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     parse_mode=ParseMode.MARKDOWN
                 )
                 
-                break # Exit session loop
+                break
 
         except Exception as e:
             logger.error(f"Bet failed: {e}", exc_info=True)
@@ -670,51 +629,38 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 # --- FastAPI Application & Webhook Setup ---
 
-# Initialize FastAPI
 app = FastAPI(title="Keno Telegram Bot API", version="1.0.0")
-# Initialize PTB ApplicationBuilder
 ptb_application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-# Add Handlers to PTB Application
 ptb_application.add_handler(CommandHandler("start", start_command))
 ptb_application.add_handler(CommandHandler("profile", profile_command))
 ptb_application.add_handler(CommandHandler("deposit", deposit_command))
 ptb_application.add_handler(CommandHandler("withdraw", withdraw_command))
 ptb_application.add_handler(CommandHandler("transfer", transfer_command))
 ptb_application.add_handler(CommandHandler("play", play_command))
-# Add admin handler here (e.g., CommandHandler("admin", admin_command))
 ptb_application.add_handler(CallbackQueryHandler(button_handler))
-ptb_application.add_handler(ptb_application.add_handler(MessageHandler(~(CommandHandler('start', start_command) | CommandHandler('profile', profile_command) | CommandHandler('deposit', deposit_command) | CommandHandler('withdraw', withdraw_command) | CommandHandler('transfer', transfer_command) | CommandHandler('play', play_command)), handle_picks_and_bet)))
+# Use MessageHandler for all non-command text, handling the betting flow
+ptb_application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_picks_and_bet))
 
 
 @app.on_event("startup")
 async def startup_event():
-    """Initializes DB, Redis, and starts the game loop when FastAPI starts."""
-    global redis_client, game_task
+    """Initializes DB and starts the game loop when FastAPI starts."""
+    global game_task
     
-    # 1. Database Initialization
     if not DATABASE_URL:
         logger.error("FATAL: DATABASE_URL not set.")
         sys.exit(1)
         
     init_db(DATABASE_URL)
+    logger.warning("NOTE: Redis is skipped. Game state is stored in-memory, suitable for single-instance free tier deployment.")
     
-    # 2. Redis Initialization (Connect to Railway Redis)
-    if not REDIS_URL:
-        logger.warning("REDIS_URL not set. Game state persistence is disabled.")
-    else:
-        # Assuming format: redis://:password@host:port (or simple redis://host:port)
-        redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
-        logger.info("Redis client connected.")
-    
-    # 3. Webhook Setup
     if not FASTAPI_PUBLIC_URL:
         logger.error("FATAL: FASTAPI_PUBLIC_URL not set.")
         sys.exit(1)
 
     webhook_url = f"{FASTAPI_PUBLIC_URL}/webhook"
     
-    # Use httpx to make the API call to set the webhook
     import httpx
     try:
         async with httpx.AsyncClient() as client:
@@ -727,8 +673,7 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Failed to set Telegram Webhook: {e}")
 
-    # 4. Start the background Keno Game Loop
-    # We pass the PTB Application Context to the loop so it can send messages.
+    # Start the background Keno Game Loop
     game_task = asyncio.create_task(run_keno_game(ptb_application.job_queue))
     logger.info("Keno Game Loop background task scheduled.")
 
@@ -739,10 +684,6 @@ async def shutdown_event():
     if game_task:
         game_task.cancel()
         logger.info("Keno Game Loop background task cancelled.")
-    
-    if redis_client:
-        await redis_client.close()
-        logger.info("Redis client closed.")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -768,11 +709,9 @@ async def telegram_webhook(request: Request):
         update_json = await request.json()
         update = Update.de_json(update_json, ptb_application.bot)
         
-        # Process the update
         await ptb_application.process_update(update)
         
         return {"status": "ok"}
     except Exception as e:
         logger.error(f"Error processing webhook update: {e}", exc_info=True)
-        # Always return 200 to Telegram even on error, to prevent endless retries
         return {"status": "error", "message": str(e)}
