@@ -10,7 +10,7 @@ from typing import Dict, List, Optional
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
 from telegram import Update, Message
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters, PicklePersistence
 from telegram.constants import ParseMode
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 from sqlmodel import select
@@ -56,6 +56,7 @@ game_loop_lock = asyncio.Lock() # Internal lock for game loop control
 async def get_db_session() -> AsyncSession:
     """Dependency to get an async database session."""
     if not engine:
+        # This error message should now be preempted by logging in startup_event
         raise RuntimeError("Database engine not initialized. Check startup logs.")
     async with AsyncSession(engine) as session:
         yield session
@@ -251,9 +252,25 @@ async def run_keno_game(context: ContextTypes.DEFAULT_TYPE):
 
         except Exception as e:
             logger.error(f"Error in game loop: {e}", exc_info=True)
-            await asyncio.sleep(10) # Wait longer after an error
+            # CRITICAL: This is the fix to ensure the error doesn't kill the task
+            if str(e) == "Database engine not initialized. Check startup logs.":
+                logger.critical("Database engine missing. Game loop cannot proceed. Waiting 60s for re-initialization...")
+                await asyncio.sleep(60) 
+            else:
+                await asyncio.sleep(10) # Wait longer after a normal error
 
 # --- Telegram Bot Handlers ---
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log the error and send a user-friendly message."""
+    logger.error("Exception while handling an update:", exc_info=context.error)
+    
+    # Check if the update object is a Message update for a clean reply
+    if isinstance(update, Update) and update.effective_message:
+        await update.effective_message.reply_text(
+            "🚨 *An unexpected error occurred.* The administrator has been notified. Please try again later.",
+            parse_mode=ParseMode.MARKDOWN
+        )
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handles admin commands like approving deposits and completing withdrawals."""
@@ -739,7 +756,7 @@ ptb_application.add_handler(CommandHandler("play", play_command))
 ptb_application.add_handler(CommandHandler("admin", admin_command)) # Admin Handler
 ptb_application.add_handler(CallbackQueryHandler(button_handler))
 ptb_application.add_handler(MessageHandler(filters.TEXT & ~(filters.COMMAND), handle_picks_and_bet))
-
+ptb_application.add_error_handler(error_handler) # <-- ADDED ERROR HANDLER
 
 @app.on_event("startup")
 async def startup_event():
@@ -751,7 +768,13 @@ async def startup_event():
         logger.error("FATAL: DATABASE_URL not set.")
         sys.exit(1)
         
-    init_db(DATABASE_URL)
+    try:
+        init_db(DATABASE_URL)
+        logger.info("Database engine initialization successful.")
+    except Exception as e:
+        logger.error(f"FATAL: Database engine initialization failed: {e}", exc_info=True)
+        # Exit the application if the DB connection fails on startup
+        sys.exit(1) 
     
     # 2. Redis Initialization (Connect to Railway Redis)
     if not REDIS_URL:
