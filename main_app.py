@@ -18,10 +18,13 @@ from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 from redis import asyncio as aioredis
 from dotenv import load_dotenv
-import httpx # Import httpx for webhook setup
+import httpx 
 
 # Local imports
-from db_setup import init_db, create_db_and_tables, engine, User, Transaction, KenoRound, Bet 
+# CRITICAL FIX: Import the entire db_setup module to ensure consistent access to its global 'engine' variable.
+import db_setup
+# Import everything else needed explicitly
+from db_setup import init_db, create_db_and_tables, User, Transaction, KenoRound, Bet 
 
 # --- Configuration & Initialization ---
 
@@ -54,9 +57,11 @@ game_loop_lock = asyncio.Lock() # Internal lock for game loop control
 
 async def get_db_session() -> AsyncSession:
     """Dependency to get an async database session."""
-    if not engine:
-        raise HTTPException(status_code=500, detail="Database engine not initialized")
-    async with AsyncSession(engine) as session:
+    # CRITICAL FIX: Use db_setup.engine for robust global access
+    if not db_setup.engine:
+        # Changed HTTPException to a standard RuntimeError for background task logging clarity
+        raise RuntimeError("Database engine not initialized. Check startup logs for init_db failure.") 
+    async with AsyncSession(db_setup.engine) as session:
         yield session
 
 async def get_or_create_user(session: AsyncSession, tg_id: int, username: str) -> User:
@@ -200,6 +205,7 @@ async def start_new_round(session: AsyncSession, context: ContextTypes.DEFAULT_T
     new_round_id = current_round_id + 1
     next_draw_time = datetime.utcnow() + timedelta(seconds=GAME_INTERVAL_SECONDS)
     
+    # This block assumes redis_client is successfully initialized
     await redis_client.set('current_round_id', str(new_round_id))
     await redis_client.set('next_draw_time', next_draw_time.isoformat())
     
@@ -212,8 +218,7 @@ async def start_new_round(session: AsyncSession, context: ContextTypes.DEFAULT_T
     
     logger.info(f"New round {new_round_id} started. Draw at {draw_time_str}")
     
-    # NOTE: To send this to all users, you would need a list of user IDs. 
-    # For now, relying on /profile refresh.
+    # NOTE: No broadcast implemented, rely on user commands.
 
 
 async def run_keno_game(context: ContextTypes.DEFAULT_TYPE):
@@ -221,7 +226,7 @@ async def run_keno_game(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Keno Game Loop started.")
     
     # Ensure tables are created on startup (idempotent)
-    # The create_db_and_tables function handles the asynchronous connection correctly
+    # create_db_and_tables uses db_setup.engine directly
     await create_db_and_tables() 
     
     # Ensure a starting round is set if Redis is empty
@@ -261,7 +266,7 @@ async def run_keno_game(context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(max(1, sleep_time)) # Sleep at least 1 second
 
         except Exception as e:
-            # This is the error location, now it should handle exceptions outside the decode error
+            # The error is caught here
             logger.error(f"Error in game loop: {e}", exc_info=True)
             await asyncio.sleep(10) # Wait longer after an error
 
