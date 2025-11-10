@@ -109,11 +109,24 @@ class Bet(SQLModel, table=True):
 engine: Optional[AsyncEngine] = None
 
 def init_db(database_url: str):
-    """Initializes the async database engine."""
+    """Initializes the async database engine, ensuring the async driver is used."""
     global engine
-    # CORRECTED LINE: Use create_async_engine for the async driver
-    engine = create_async_engine(database_url, echo=False, pool_recycle=3600)
-    print("Database engine initialized.")
+    
+    # CRITICAL FIX: Ensure the database URL uses the async dialect (+asyncpg).
+    # Hosting providers often provide 'postgresql://', which must be replaced.
+    if database_url.startswith("postgresql://"):
+        async_database_url = database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    elif database_url.startswith("postgres://"):
+        # Handle the shorter URL form often used in older configurations
+        async_database_url = database_url.replace("postgres://", "postgresql+asyncpg://", 1)
+    else:
+        async_database_url = database_url
+    
+    # Use the corrected URL to create the async engine
+    engine = create_async_engine(async_database_url, echo=False, pool_recycle=3600)
+    print("Database engine initialized with async driver.")
+
+# ... (lines after init_db function, including create_db_and_tables and __main__ block) ...
 
 async def create_db_and_tables():
     """Creates all tables defined in the SQLModel classes if they don't exist."""
@@ -139,3 +152,4 @@ if __name__ == "__main__":
         asyncio.run(create_db_and_tables())
     else:
         print("Please set the DATABASE_URL environment variable in your .env file.")
+
