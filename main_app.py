@@ -9,7 +9,6 @@ from typing import Dict, List, Optional
 # Third-party libraries
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
-# CRITICAL: Added MessageHandler and filters to the import
 from telegram import Update, Message
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters, PicklePersistence 
 from telegram.constants import ParseMode
@@ -21,8 +20,6 @@ from dotenv import load_dotenv
 import httpx 
 
 # Local imports
-# Ensure db_setup.py is accessible in the same directory
-# Assuming db_setup.py remains unchanged and accessible
 from db_setup import init_db, create_db_and_tables, engine, User, Transaction, KenoRound, Bet
 
 # --- Configuration & Initialization ---
@@ -41,7 +38,8 @@ MIN_BET_AMOUNT = 5.0
 KENO_MAX_NUMBERS = 80
 KENO_DRAW_COUNT = 20
 KENO_MAX_PICKS = 10
-ADMIN_ID = 557555000 # Placeholder: Replace with your actual Telegram User ID (Used 557555000 from your file)
+# 👑 Admin User ID Set to 441774500 (Corrected)
+ADMIN_ID = 441774500 
 
 # Logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -57,7 +55,6 @@ game_loop_lock = asyncio.Lock() # Internal lock for game loop control
 async def get_db_session() -> AsyncSession:
     """Dependency to get an async database session."""
     if not engine:
-        # CRITICAL FIX: Raise a simpler RuntimeError in background tasks
         raise RuntimeError("Database engine not initialized. Check startup logs.")
     async with AsyncSession(engine) as session:
         yield session
@@ -98,7 +95,6 @@ async def get_next_draw_time() -> datetime:
     if redis_client:
         draw_time_str = await redis_client.get('next_draw_time')
         if draw_time_str:
-            # FIX: No .decode() needed if decode_responses=True is used on aioredis client
             return datetime.fromisoformat(draw_time_str) 
     return datetime.utcnow() + timedelta(seconds=GAME_INTERVAL_SECONDS)
 
@@ -208,7 +204,6 @@ async def run_keno_game(context: ContextTypes.DEFAULT_TYPE):
 
 # --- Telegram Bot Handlers ---
 
-# CRITICAL FIX: Add a generic error handler to prevent the "No error handlers registered" error
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Log the error and send a user-friendly message."""
     logger.error("Exception while handling an update:", exc_info=context.error)
@@ -219,7 +214,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             parse_mode=ParseMode.MARKDOWN
         )
 
-# CRITICAL FIX: Add the missing admin command handler, referenced in deposit/withdraw
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handles admin commands like approving deposits and completing withdrawals."""
     tg_id = update.effective_user.id
@@ -523,18 +517,17 @@ ptb_application.add_handler(CommandHandler("deposit", deposit_command))
 ptb_application.add_handler(CommandHandler("withdraw", withdraw_command))
 ptb_application.add_handler(CommandHandler("transfer", transfer_command))
 ptb_application.add_handler(CommandHandler("play", play_command))
-ptb_application.add_handler(CommandHandler("admin", admin_command)) # Added admin command
+ptb_application.add_handler(CommandHandler("admin", admin_command)) 
 ptb_application.add_handler(CallbackQueryHandler(button_handler))
-# CRITICAL FIX: Correct MessageHandler registration
 ptb_application.add_handler(MessageHandler(filters.TEXT & ~(filters.COMMAND), handle_picks_and_bet))
-ptb_application.add_error_handler(error_handler) # CRITICAL FIX: Added error handler
+ptb_application.add_error_handler(error_handler)
 
 @app.on_event("startup")
 async def startup_event():
     """Initializes DB, Redis, and starts the game loop when FastAPI starts."""
     global redis_client, game_task
     
-    # 1. Database Initialization (CRITICAL FIX: Added try/except)
+    # 1. Database Initialization
     if not DATABASE_URL:
         logger.error("FATAL: DATABASE_URL not set.")
         sys.exit(1)
@@ -554,7 +547,7 @@ async def startup_event():
         redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
         logger.info("Redis client connected.")
 
-    # 3. PTB Application Initialization (CRITICAL FIX: Required before starting tasks/webhooks)
+    # 3. PTB Application Initialization 
     await ptb_application.initialize()
     
     # 4. Webhook Setup
