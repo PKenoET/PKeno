@@ -10,8 +10,8 @@ from typing import Dict, List, Optional
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
 from telegram import Update, Message
-# MessageHandler and filters are now explicitly imported
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters 
+# CRITICAL IMPORT: Import Application, needed for webhook setup
+from telegram.ext import Application, ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters 
 from telegram.constants import ParseMode
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 from sqlmodel import select
@@ -21,9 +21,7 @@ from dotenv import load_dotenv
 import httpx 
 
 # Local imports
-# CRITICAL FIX: Import the entire db_setup module to ensure consistent access to its global 'engine' variable.
 import db_setup
-# Import everything else needed explicitly
 from db_setup import init_db, create_db_and_tables, User, Transaction, KenoRound, Bet 
 
 # --- Configuration & Initialization ---
@@ -52,14 +50,13 @@ logger = logging.getLogger(__name__)
 redis_client: Optional[aioredis.Redis] = None
 game_task: Optional[asyncio.Task] = None
 game_loop_lock = asyncio.Lock() # Internal lock for game loop control
+ptb_application: Optional[Application] = None # Global PTB application instance
 
 # --- Utility Functions ---
 
 async def get_db_session() -> AsyncSession:
     """Dependency to get an async database session."""
-    # CRITICAL FIX: Use db_setup.engine for robust global access
     if not db_setup.engine:
-        # Changed HTTPException to a standard RuntimeError for background task logging clarity
         raise RuntimeError("Database engine not initialized. Check startup logs for init_db failure.") 
     async with AsyncSession(db_setup.engine) as session:
         yield session
@@ -92,7 +89,6 @@ async def get_current_round_id() -> int:
     """Fetches the current active round ID from Redis."""
     if redis_client:
         round_id = await redis_client.get('current_round_id')
-        # CORRECTED LINE: round_id is already a string because decode_responses=True
         return int(round_id) if round_id else 1 
     return 1 # Fallback to 1 if Redis is unavailable
 
@@ -101,7 +97,6 @@ async def get_next_draw_time() -> datetime:
     if redis_client:
         draw_time_str = await redis_client.get('next_draw_time')
         if draw_time_str:
-            # Explicitly parse the time string from Redis
             return datetime.fromisoformat(draw_time_str)
     return datetime.utcnow() + timedelta(seconds=GAME_INTERVAL_SECONDS)
 
@@ -205,7 +200,6 @@ async def start_new_round(session: AsyncSession, context: ContextTypes.DEFAULT_T
     new_round_id = current_round_id + 1
     next_draw_time = datetime.utcnow() + timedelta(seconds=GAME_INTERVAL_SECONDS)
     
-    # This block assumes redis_client is successfully initialized
     await redis_client.set('current_round_id', str(new_round_id))
     await redis_client.set('next_draw_time', next_draw_time.isoformat())
     
@@ -225,8 +219,6 @@ async def run_keno_game(context: ContextTypes.DEFAULT_TYPE):
     """The main continuous game loop, running in a background task."""
     logger.info("Keno Game Loop started.")
     
-    # Ensure tables are created on startup (idempotent)
-    # create_db_and_tables uses db_setup.engine directly
     await create_db_and_tables() 
     
     # Ensure a starting round is set if Redis is empty
@@ -266,7 +258,6 @@ async def run_keno_game(context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(max(1, sleep_time)) # Sleep at least 1 second
 
         except Exception as e:
-            # The error is caught here
             logger.error(f"Error in game loop: {e}", exc_info=True)
             await asyncio.sleep(10) # Wait longer after an error
 
@@ -659,26 +650,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 # Initialize FastAPI
 app = FastAPI(title="Keno Telegram Bot API", version="1.0.0")
-# Initialize PTB ApplicationBuilder
-ptb_application = ApplicationBuilder().token(BOT_TOKEN).build()
+# ptb_application will be initialized in startup_event now
 
-# Add Handlers to PTB Application
-ptb_application.add_handler(CommandHandler("start", start_command))
-ptb_application.add_handler(CommandHandler("profile", profile_command))
-ptb_application.add_handler(CommandHandler("deposit", deposit_command))
-ptb_application.add_handler(CommandHandler("withdraw", withdraw_command))
-ptb_application.add_handler(CommandHandler("transfer", transfer_command))
-ptb_application.add_handler(CommandHandler("play", play_command))
-ptb_application.add_handler(CallbackQueryHandler(button_handler))
-
-# CORRECTED HANDLER LINE: Catches all text messages that are NOT commands
-ptb_application.add_handler(MessageHandler(filters.TEXT & ~(filters.COMMAND | filters.Regex(r'^\/')), handle_picks_and_bet))
+# Add Handlers to PTB Application is now done in startup_event
 
 
 @app.on_event("startup")
 async def startup_event():
     """Initializes DB, Redis, and starts the game loop when FastAPI starts."""
-    global redis_client, game_task
+    global redis_client, game_task, ptb_application
     
     # 1. Database Initialization
     if not DATABASE_URL:
@@ -691,12 +671,31 @@ async def startup_event():
     if not REDIS_URL:
         logger.warning("REDIS_URL not set. Game state persistence is disabled.")
     else:
-        # Use from_url for easy connection with the REDIS_URL format
-        # NOTE: decode_responses=True means Redis returns strings, not bytes.
         redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
         logger.info("Redis client connected.")
     
-    # 3. Webhook Setup
+    # 3. PTB Application Initialization (CRITICAL FIX)
+    # Use Application.initialize() for async webhook-based setups
+    ptb_application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    # 4. Add Handlers to the initialized Application
+    ptb_application.add_handler(CommandHandler("start", start_command))
+    ptb_application.add_handler(CommandHandler("profile", profile_command))
+    ptb_application.add_handler(CommandHandler("deposit", deposit_command))
+    ptb_application.add_handler(CommandHandler("withdraw", withdraw_command))
+    ptb_application.add_handler(CommandHandler("transfer", transfer_command))
+    ptb_application.add_handler(CommandHandler("play", play_command))
+    ptb_application.add_handler(CallbackQueryHandler(button_handler))
+    ptb_application.add_handler(MessageHandler(filters.TEXT & ~(filters.COMMAND | filters.Regex(r'^\/')), handle_picks_and_bet))
+
+    # Initialize the PTB application's internal structure for async processing
+    await ptb_application.initialize()
+    
+    # 5. Webhook Setup
     if not FASTAPI_PUBLIC_URL:
         logger.error("FATAL: FASTAPI_PUBLIC_URL not set.")
         sys.exit(1)
@@ -704,7 +703,8 @@ async def startup_event():
     webhook_url = f"{FASTAPI_PUBLIC_URL}/webhook"
     
     try:
-        # httpx is necessary for async HTTP calls
+        # NOTE: PTB's set_webhook is usually more robust, but using httpx directly 
+        # is fine if you're deploying on platforms that need a public URL set explicitly.
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
@@ -715,8 +715,8 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Failed to set Telegram Webhook: {e}")
 
-    # 4. Start the background Keno Game Loop
-    # We pass the job_queue, though it's not strictly necessary for this loop's current design
+    # 6. Start the background Keno Game Loop
+    # We use the job_queue from the initialized application
     game_task = asyncio.create_task(run_keno_game(ptb_application.job_queue))
     logger.info("Keno Game Loop background task scheduled.")
 
@@ -752,8 +752,16 @@ async def home():
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
     """The main endpoint that receives updates from Telegram."""
+    global ptb_application
+    if ptb_application is None:
+        logger.error("PTB Application not initialized.")
+        return {"status": "error", "message": "PTB Application not initialized"}, 500
+
     try:
         update_json = await request.json()
+        
+        # Pass the update JSON directly to the application's update processing method
+        # which is designed for webhook data.
         update = Update.de_json(update_json, ptb_application.bot)
         
         # Process the update
