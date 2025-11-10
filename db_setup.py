@@ -9,12 +9,10 @@ import json
 # Corrected imports for SQLModel async functionality
 from sqlmodel import Field, SQLModel, create_engine
 from sqlmodel.ext.asyncio.session import AsyncSession 
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine # This fixes the 'AsyncEngine' import error
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine # Fixes 'AsyncEngine' import error
 
 
 # --- Database Configuration ---
-# NOTE: In deployment (Railway/Render), this URL is automatically provided via the DATABASE_URL environment variable.
-# Local placeholder URL:
 DATABASE_URL = "postgresql+asyncpg://postgres:password@localhost/keno_db" 
 
 # --- Models ---
