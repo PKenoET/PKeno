@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import List, Optional
 
 from sqlmodel import Field, SQLModel, create_engine, Session
-from sqlmodel.ext.asyncio.session import AsyncEngine
+from sqlalchemy.ext.asyncio.engine import AsyncEngine
 from pydantic import model_validator
 import json
 
@@ -139,4 +139,5 @@ if __name__ == "__main__":
     else:
 
         print("Please set the DATABASE_URL environment variable.")
+
 
