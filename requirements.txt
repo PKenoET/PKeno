@@ -1,21 +1,17 @@
-FastAPI and utilities
-
+# FastAPI and utilities
 fastapi
 uvicorn[standard]
 pydantic
 python-dotenv # For local development
 httpx # Required for setting Telegram webhook
 
-Telegram Bot Library (PTB)
-
+# Telegram Bot Library (PTB)
 python-telegram-bot[asyncio]>=21.0
 
-Database (PostgreSQL)
-
+# Database (PostgreSQL)
 sqlmodel>=0.0.18
 psycopg[binary]
 asyncpg
 
-Cache/Distributed State (Redis)
-
+# Cache/Distributed State (Redis)
 redis
