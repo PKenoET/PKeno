@@ -9,10 +9,11 @@ import json
 # Corrected imports for SQLModel async functionality
 from sqlmodel import Field, SQLModel, create_engine
 from sqlmodel.ext.asyncio.session import AsyncSession 
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine # Fixes 'AsyncEngine' import error
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine 
 
 
 # --- Database Configuration ---
+# NOTE: This line is for local setup default, will be overwritten by env var in deployment
 DATABASE_URL = "postgresql+asyncpg://postgres:password@localhost/keno_db" 
 
 # --- Models ---
@@ -113,11 +114,9 @@ def init_db(database_url: str):
     global engine
     
     # CRITICAL FIX: Ensure the database URL uses the async dialect (+asyncpg).
-    # Hosting providers often provide 'postgresql://', which must be replaced.
     if database_url.startswith("postgresql://"):
         async_database_url = database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
     elif database_url.startswith("postgres://"):
-        # Handle the shorter URL form often used in older configurations
         async_database_url = database_url.replace("postgres://", "postgresql+asyncpg://", 1)
     else:
         async_database_url = database_url
@@ -126,11 +125,10 @@ def init_db(database_url: str):
     engine = create_async_engine(async_database_url, echo=False, pool_recycle=3600)
     print("Database engine initialized with async driver.")
 
-# ... (lines after init_db function, including create_db_and_tables and __main__ block) ...
-
 async def create_db_and_tables():
     """Creates all tables defined in the SQLModel classes if they don't exist."""
     print("Attempting to create database tables...")
+    # NOTE: Using the global 'engine' directly here
     if engine:
         async with engine.begin() as conn:
             # Drop tables for fresh start (optional, comment out for production)
@@ -152,4 +150,3 @@ if __name__ == "__main__":
         asyncio.run(create_db_and_tables())
     else:
         print("Please set the DATABASE_URL environment variable in your .env file.")
-
