@@ -664,7 +664,7 @@ ptb_application.add_handler(CommandHandler("transfer", transfer_command))
 ptb_application.add_handler(CommandHandler("play", play_command))
 ptb_application.add_handler(CallbackQueryHandler(button_handler))
 
-# CORRECTED HANDLER LINE: Catches all text messages that are NOT commands (filters.COMMAND and regex for '/')
+# CORRECTED HANDLER LINE: Catches all text messages that are NOT commands
 ptb_application.add_handler(MessageHandler(filters.TEXT & ~(filters.COMMAND | filters.Regex(r'^\/')), handle_picks_and_bet))
 
 
