@@ -4,14 +4,15 @@ from typing import List, Optional
 import os
 import asyncio
 from dotenv import load_dotenv
-
-from sqlmodel import Field, SQLModel, create_engine
-from sqlmodel.ext.asyncio.session import AsyncEngine
-# Removed unused import: from pydantic import model_validator
 import json
 
+from sqlmodel import Field, SQLModel, create_engine # NOTE: Keep create_engine for sync engine creation in local runs if needed, but we use asyncpg for the main engine
+from sqlmodel.ext.asyncio.session import AsyncSession # Used for type hinting the session
+# CORRECTED IMPORT: AsyncEngine and create_async_engine are now imported from SQLAlchemy's asyncio extension
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine 
+
+
 # --- Database Configuration ---
-# NOTE: In deployment (Railway/Render), this URL is automatically provided via the DATABASE_URL environment variable.
 # Local placeholder URL:
 DATABASE_URL = "postgresql+asyncpg://postgres:password@localhost/keno_db" 
 
@@ -106,13 +107,14 @@ class Bet(SQLModel, table=True):
 # --- Initialization Functions ---
 
 # Global variable to hold the engine instance
-engine: Optional[AsyncEngine] = None
+# NOTE: The type hint for the global variable remains AsyncEngine
+engine: Optional[AsyncEngine] = None 
 
 def init_db(database_url: str):
     """Initializes the async database engine."""
     global engine
-    # The URL should start with 'postgresql+asyncpg' for async SQLModel
-    engine = AsyncEngine(create_engine(database_url, echo=False, pool_recycle=3600))
+    # CORRECTED LINE: Use create_async_engine for the async driver
+    engine = create_async_engine(database_url, echo=False, pool_recycle=3600)
     print("Database engine initialized.")
 
 async def create_db_and_tables():
