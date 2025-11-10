@@ -87,8 +87,8 @@ async def get_current_round_id() -> int:
     """Fetches the current active round ID from Redis."""
     if redis_client:
         round_id = await redis_client.get('current_round_id')
-        # Use a safe way to decode and convert
-        return int(round_id.decode()) if round_id else 1 
+        # CORRECTED LINE: round_id is already a string because decode_responses=True
+        return int(round_id) if round_id else 1 
     return 1 # Fallback to 1 if Redis is unavailable
 
 async def get_next_draw_time() -> datetime:
@@ -221,6 +221,7 @@ async def run_keno_game(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Keno Game Loop started.")
     
     # Ensure tables are created on startup (idempotent)
+    # The create_db_and_tables function handles the asynchronous connection correctly
     await create_db_and_tables() 
     
     # Ensure a starting round is set if Redis is empty
@@ -260,6 +261,7 @@ async def run_keno_game(context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(max(1, sleep_time)) # Sleep at least 1 second
 
         except Exception as e:
+            # This is the error location, now it should handle exceptions outside the decode error
             logger.error(f"Error in game loop: {e}", exc_info=True)
             await asyncio.sleep(10) # Wait longer after an error
 
@@ -685,6 +687,7 @@ async def startup_event():
         logger.warning("REDIS_URL not set. Game state persistence is disabled.")
     else:
         # Use from_url for easy connection with the REDIS_URL format
+        # NOTE: decode_responses=True means Redis returns strings, not bytes.
         redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
         logger.info("Redis client connected.")
     
@@ -708,6 +711,7 @@ async def startup_event():
         logger.error(f"Failed to set Telegram Webhook: {e}")
 
     # 4. Start the background Keno Game Loop
+    # We pass the job_queue, though it's not strictly necessary for this loop's current design
     game_task = asyncio.create_task(run_keno_game(ptb_application.job_queue))
     logger.info("Keno Game Loop background task scheduled.")
 
