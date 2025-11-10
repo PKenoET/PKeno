@@ -1,23 +1,19 @@
-FastAPI and utilities
-
+# FastAPI and utilities
 fastapi
 uvicorn[standard]
 pydantic
 python-dotenv # For local development
 httpx # Added for Webhook calls
 
-Telegram Bot Library (PTB)
-
+# Telegram Bot Library (PTB)
 python-telegram-bot[asyncio]>=21.0
 
-Database (PostgreSQL)
-
+# Database (PostgreSQL)
 sqlmodel>=0.0.18
 # Using asyncpg driver for async connections
 asyncpg
 # Add psycopg2-binary to satisfy synchronous setup paths required by SQLAlchemy's AsyncEngine
 psycopg2-binary 
 
-Cache/Distributed State (Redis)
-
+# Cache/Distributed State (Redis)
 redis
