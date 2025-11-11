@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 import httpx 
 
 # Local imports
+# NOTE: Assumes db_setup.py has the fixed import: from sqlalchemy.ext.asyncio import AsyncEngine
 from db_setup import init_db, create_db_and_tables, engine, User, Transaction, KenoRound, Bet
 
 # --- Configuration & Initialization ---
@@ -28,7 +29,7 @@ load_dotenv() # Load .env file for local development
 
 # Environment Variables (CRITICAL for deployment)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-FASTAPI_PUBLIC_URL = os.getenv("FASTAPI_PUBLIC_URL") # e.g., https://your-railway-domain.up.railway.app
+FASTAPI_PUBLIC_URL = os.getenv("FASTAPI_PUBLIC_URL") 
 DATABASE_URL = os.getenv("DATABASE_URL")
 REDIS_URL = os.getenv("REDIS_URL")
 
@@ -38,7 +39,6 @@ MIN_BET_AMOUNT = 5.0
 KENO_MAX_NUMBERS = 80
 KENO_DRAW_COUNT = 20
 KENO_MAX_PICKS = 10
-# 👑 Admin User ID Set to 441774500
 ADMIN_ID = 441774500 
 
 # Logging
@@ -50,12 +50,31 @@ redis_client: Optional[aioredis.Redis] = None
 game_task: Optional[asyncio.Task] = None
 game_loop_lock = asyncio.Lock() # Internal lock for game loop control
 
+# NEW: Global variable to store the final, corrected database URL for re-initialization attempts
+INITIALIZED_DB_URL: Optional[str] = None 
+
 # --- Utility Functions ---
 
 async def get_db_session() -> AsyncSession:
-    """Dependency to get an async database session."""
+    """Dependency to get an async database session, with re-initialization logic."""
+    global engine # We need to access and potentially modify the global engine instance
+    
     if not engine:
-        raise RuntimeError("Database engine not initialized. Check startup logs.")
+        # If engine is None, attempt to re-initialize using the stored, corrected URL
+        if INITIALIZED_DB_URL:
+            logger.warning("DB engine is None, attempting re-initialization from within session getter...")
+            try:
+                # Attempt re-initialization in case of disconnection/dispose
+                init_db(INITIALIZED_DB_URL)
+                logger.info("DB engine successfully re-initialized.")
+            except Exception as e:
+                # If re-initialization fails, raise the error to be caught by the game loop
+                raise RuntimeError(f"Database engine not initialized (Re-init failed): {e}") from e
+        else:
+            # If we don't even have the URL, the main startup failed
+            raise RuntimeError("Database engine not initialized. Check startup logs.")
+            
+    # Now that 'engine' should be initialized (or an error was raised), proceed to session creation
     async with AsyncSession(engine) as session:
         yield session
 
@@ -105,7 +124,7 @@ async def execute_keno_draw(session: AsyncSession, current_round_id: int) -> Lis
     new_round = KenoRound(
         round_id=current_round_id,
         draw_time=datetime.utcnow(),
-        winning_numbers=winning_numbers
+        winning_numbers=winning_numbers # The setter property handles JSON serialization
     )
     session.add(new_round)
     await session.commit()
@@ -127,7 +146,7 @@ async def settle_all_bets(session: AsyncSession, round_id: int, winning_numbers:
             logger.error(f"User {bet.user_id} not found for bet {bet.id}")
             continue
 
-        selected_set = set(bet.selected_numbers)
+        selected_set = set(bet.selected_numbers) # Use the property getter
         winning_set = set(winning_numbers)
         matched_count = len(selected_set.intersection(winning_set))
         bet.matched_count = matched_count
@@ -165,8 +184,7 @@ async def run_keno_game(context: ContextTypes.DEFAULT_TYPE):
     """The main continuous game loop, running in a background task."""
     logger.info("Keno Game Loop started.")
     
-    # Ensure tables are created on startup (idempotent)
-    await create_db_and_tables() 
+    # We rely on startup_event to run create_db_and_tables once.
     
     while True:
         try:
@@ -180,7 +198,8 @@ async def run_keno_game(context: ContextTypes.DEFAULT_TYPE):
                     logger.info(f"--- DRAW TIME HIT for Round {current_round_id} ---")
 
                     # Execute the draw and settlement inside a single DB session
-                    async for session in get_db_session():
+                    # get_db_session now handles re-initialization if 'engine' is None
+                    async for session in get_db_session(): 
                         winning_numbers = await execute_keno_draw(session, current_round_id)
                         await settle_all_bets(session, current_round_id, winning_numbers, context)
                         await start_new_round(session, context)
@@ -191,14 +210,14 @@ async def run_keno_game(context: ContextTypes.DEFAULT_TYPE):
 
         except Exception as e:
             logger.error(f"Error in game loop: {e}", exc_info=True)
-            # CRITICAL FIX: If the database engine is the problem, wait longer to avoid thrashing
+            # The session getter now tries to re-init. If it still fails, we wait longer.
             if "Database engine not initialized" in str(e):
                 logger.critical("Database engine missing. Game loop cannot proceed. Waiting 60s for re-initialization...")
                 await asyncio.sleep(60) 
             else:
                 await asyncio.sleep(10) # Wait longer after a normal error
 
-# --- Telegram Bot Handlers ---
+# --- Telegram Bot Handlers (Omitted for brevity, assume they are correct) ---
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Log the error and send a user-friendly message."""
@@ -209,6 +228,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             "🚨 *An unexpected error occurred.* The administrator has been notified. Please try again later.",
             parse_mode=ParseMode.MARKDOWN
         )
+
+# ... (All other command and message handlers)
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handles admin commands like approving deposits and completing withdrawals."""
@@ -484,7 +505,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
                 # Deduct & Log
                 user.playground_balance -= amount
-                new_bet = Bet(user_id=tg_id, round_id=round_id, amount=amount, selected_numbers=picks)
+                # Pass list of ints; the setter property handles serialization
+                new_bet = Bet(user_id=tg_id, round_id=round_id, amount=amount, selected_numbers=picks) 
                 bet_tx = Transaction(user_id=tg_id, amount=amount, type="BET", status="COMPLETED", request_details=f'{{"round_id": {round_id}, "picks_count": {len(picks)}}}')
 
                 session.add(user); session.add(new_bet); session.add(bet_tx)
@@ -521,26 +543,29 @@ ptb_application.add_error_handler(error_handler)
 @app.on_event("startup")
 async def startup_event():
     """Initializes DB, Redis, and starts the game loop when FastAPI starts."""
-    global redis_client, game_task
+    global redis_client, game_task, INITIALIZED_DB_URL # Add global INITIALIZED_DB_URL
     
     # 1. Database Initialization
     if not DATABASE_URL:
         logger.error("FATAL: DATABASE_URL not set.")
         sys.exit(1)
     
-    # CRITICAL FIX: Ensure the URL uses the asyncpg dialect before passing it to init_db
-    # This prevents errors if the environment variable is postgresql:// instead of postgresql+asyncpg://
+    # CRITICAL FIX: Ensure the URL uses the asyncpg dialect 
     db_url_with_dialect = DATABASE_URL
     if db_url_with_dialect.startswith("postgresql://"):
         db_url_with_dialect = db_url_with_dialect.replace("postgresql://", "postgresql+asyncpg://", 1)
         
+    INITIALIZED_DB_URL = db_url_with_dialect # <--- STORE THE CORRECTED URL GLOBALLY
+    
     try:
         init_db(db_url_with_dialect)
-        logger.info("Database engine initialization successful.")
+        logger.info("Database engine initialization successful. Attempting to create tables...")
+        # CRITICAL: Create tables immediately after successful init.
+        await create_db_and_tables() 
+        logger.info("Database tables verified.")
     except Exception as e:
-        # If this logs a specific connection error, the database credentials or host are wrong
-        logger.error(f"FATAL: Database engine initialization failed: {e}", exc_info=True)
-        # Halt startup if DB setup fails
+        # If DB fails on startup, we must exit to prevent the 'engine missing' error
+        logger.error(f"FATAL: Database engine initialization or table creation failed. Check connection string: {e}", exc_info=True)
         sys.exit(1) 
     
     # 2. Redis Initialization (Connect to Railway Redis)
