@@ -1,23 +1,20 @@
 from datetime import datetime
 from typing import List, Optional
+import json
 
 from sqlmodel import Field, SQLModel, create_engine, Session
 from pydantic import model_validator
-import json
 
-# --- FIX: Changed import path from sqlmodel.ext.asyncio.session ---
-# This is the correct, robust path for AsyncEngine in modern SQLAlchemy/SQLModel.
+# --- CRITICAL FIX 1: Corrected import path for AsyncEngine ---
 from sqlalchemy.ext.asyncio import AsyncEngine 
 
 # Global variable to hold the engine instance
 engine: Optional[AsyncEngine] = None
 
-# --- Models ---
+# --- Models (Ensuring they are present for reference) ---
 
 class User(SQLModel, table=True):
-    """Stores user wallets and admin status."""
     __tablename__ = 'users'
-
     id: Optional[int] = Field(default=None, primary_key=True)
     telegram_id: int = Field(index=True, unique=True)
     username: Optional[str] = None
@@ -28,11 +25,9 @@ class User(SQLModel, table=True):
 
 
 class Transaction(SQLModel, table=True):
-    """Detailed audit log for every financial movement."""
     __tablename__ = 'transactions'
-
     id: Optional[int] = Field(default=None, primary_key=True)
-    user_id: int = Field(index=True) 
+    user_id: int = Field(index=True)
     amount: float
     type: str 
     status: str = Field(default="PENDING")
@@ -41,9 +36,7 @@ class Transaction(SQLModel, table=True):
 
 
 class KenoRound(SQLModel, table=True):
-    """Stores the history of Keno game rounds."""
     __tablename__ = 'keno_rounds'
-
     id: Optional[int] = Field(default=None, primary_key=True)
     round_id: int = Field(index=True, unique=True)
     draw_time: datetime
@@ -51,19 +44,15 @@ class KenoRound(SQLModel, table=True):
 
     @property
     def winning_numbers(self) -> List[int]:
-        """Converts the stored JSON string back to a list of integers."""
         return json.loads(self.winning_numbers_json)
 
     @winning_numbers.setter
     def winning_numbers(self, numbers: List[int]):
-        """Converts the list of integers to a JSON string for storage."""
         self.winning_numbers_json = json.dumps(numbers)
 
 
 class Bet(SQLModel, table=True):
-    """Records individual user bets."""
     __tablename__ = 'bets'
-
     id: Optional[int] = Field(default=None, primary_key=True)
     user_id: int = Field(index=True)
     round_id: int = Field(index=True)
@@ -78,31 +67,32 @@ class Bet(SQLModel, table=True):
 
     @property
     def selected_numbers(self) -> List[int]:
-        """Converts the stored JSON string back to a list of integers."""
         return json.loads(self.selected_numbers_json)
 
     @selected_numbers.setter
     def selected_numbers(self, numbers: List[int]):
-        """Converts the list of integers to a JSON string for storage."""
         self.selected_numbers_json = json.dumps(numbers)
 
 
 # --- Initialization Functions ---
 
 def init_db(database_url: str):
-    """Initializes the async database engine."""
+    """Initializes the async database engine, catching underlying errors."""
     global engine
-    # NOTE: The URL should start with 'postgresql+asyncpg' for this setup to work.
-    engine = AsyncEngine(
-        create_engine(
-            database_url, 
-            echo=False, 
-            pool_recycle=3600,
-            # Use connect_args to prevent unexpected closed connections during long idle times
-            connect_args={"server_settings": {"jit": "off"}} 
+    try:
+        # CRITICAL FIX 2: Added connect_args for stability in hosted environments
+        engine = AsyncEngine(
+            create_engine(
+                database_url, 
+                echo=False, 
+                pool_recycle=3600,
+                connect_args={"server_settings": {"jit": "off"}} # Prevents connection issues
+            )
         )
-    )
-    print("Database engine initialized.")
+        print("Database engine initialized.")
+    except Exception as e:
+        # CRITICAL FIX 3: Re-raise the exception to force the logs to show the root cause
+        raise RuntimeError(f"FATAL: Failed to initialize DB engine. Check credentials/host in URL: {e}") from e
 
 async def create_db_and_tables():
     """Creates all tables defined in the SQLModel classes if they don't exist."""
@@ -112,7 +102,8 @@ async def create_db_and_tables():
             await conn.run_sync(SQLModel.metadata.create_all)
             print("Database tables created successfully.")
     else:
-        print("Error: Database engine not initialized.")
+        # This will ensure an error is raised if init_db failed
+        raise RuntimeError("Database engine still not initialized after init_db was called.")
 
 if __name__ == "__main__":
     import asyncio
