@@ -1,134 +1,104 @@
 from datetime import datetime
 from typing import List, Optional
-# Imports needed for local execution block
-import os
-import asyncio
-from dotenv import load_dotenv
+
+# NOTE: Added JSON to imports
+from sqlmodel import Field, SQLModel, create_engine, Session
+from sqlmodel.ext.asyncio.session import AsyncEngine
+from pydantic import model_validator
 import json
 
-# Corrected imports for SQLModel async functionality
-from sqlmodel import Field, SQLModel, create_engine
-from sqlmodel.ext.asyncio.session import AsyncSession 
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine 
-
-
 # --- Database Configuration ---
-# NOTE: This line is for local setup default, will be overwritten by env var in deployment
-DATABASE_URL = "postgresql+asyncpg://postgres:password@localhost/keno_db" 
+# Global variable to hold the engine instance
+engine: Optional[AsyncEngine] = None
 
-# --- Models ---
+# --- Models (omitted for brevity, assume they are correct) ---
+# (User, Transaction, KenoRound, Bet classes here...)
 
+# For brevity, re-including the definitions of the models for the final code
 class User(SQLModel, table=True):
-    """Stores user wallets and admin status."""
     __tablename__ = 'users'
-
     id: Optional[int] = Field(default=None, primary_key=True)
     telegram_id: int = Field(index=True, unique=True)
     username: Optional[str] = None
-
-    # Wallet Balances (Vault for cold storage, Playground for active betting)
     vault_balance: float = Field(default=0.0)
     playground_balance: float = Field(default=0.0)
-
-    # System Status
     is_admin: bool = Field(default=False)
     created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
 
-
 class Transaction(SQLModel, table=True):
-    """
-    Detailed audit log for every financial movement.
-    Type: DEPOSIT, WITHDRAW, TRANSFER_IN, TRANSFER_OUT, BET, WIN, FEE
-    Status: PENDING, COMPLETED, FAILED
-    """
     __tablename__ = 'transactions'
-
     id: Optional[int] = Field(default=None, primary_key=True)
-    user_id: int = Field(index=True) # References the User.telegram_id
+    user_id: int = Field(index=True)
     amount: float
-    type: str # 'DEPOSIT', 'WITHDRAW', 'BET', 'WIN', 'TRANSFER_IN', 'TRANSFER_OUT'
-    status: str = Field(default="PENDING") # 'PENDING', 'COMPLETED', 'FAILED', 'CANCELLED'
+    type: str # DEPOSIT, WITHDRAW, TRANSFER_IN_V, TRANSFER_OUT_P, BET, WIN
+    status: str # PENDING, COMPLETED, FAILED
+    request_details: str = Field(default="{}") # JSON string
     created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
 
-    # Request metadata (used primarily for deposits/withdrawals)
-    request_details: str = Field(default_factory=lambda: "{}") # JSON string for payment details, etc.
-
-
 class KenoRound(SQLModel, table=True):
-    """Stores the history of Keno game rounds."""
     __tablename__ = 'keno_rounds'
-
     id: Optional[int] = Field(default=None, primary_key=True)
     round_id: int = Field(index=True, unique=True)
-    draw_time: datetime # The time the draw actually occurred
-    winning_numbers_json: str = Field(default_factory=lambda: "[]") # Stores JSON string of 20 winning numbers
-
-    # Automatically converts JSON string to list of ints when reading
+    draw_time: datetime
+    winning_numbers: List[int] = Field(default=[], sa_column_kwargs={"type": json.loads}) # Stored as JSON string
+    is_settled: bool = Field(default=False)
+    
+    @model_validator(mode="before")
+    def validate_numbers(cls, values):
+        # Convert List[int] to JSON string before storing
+        if isinstance(values.get('winning_numbers'), list):
+            values['winning_numbers'] = json.dumps(values['winning_numbers'])
+        return values
+    
     @property
     def winning_numbers(self) -> List[int]:
-        """Converts the stored JSON string back to a list of integers."""
-        return json.loads(self.winning_numbers_json)
-
-    @winning_numbers.setter
-    def winning_numbers(self, numbers: List[int]):
-        """Converts the list of integers to a JSON string for storage."""
-        self.winning_numbers_json = json.dumps(numbers)
-
+        # Getter to convert JSON string back to List[int]
+        return json.loads(self.sa_data.get("winning_numbers", "[]"))
 
 class Bet(SQLModel, table=True):
-    """Records individual user bets."""
     __tablename__ = 'bets'
-
     id: Optional[int] = Field(default=None, primary_key=True)
     user_id: int = Field(index=True)
     round_id: int = Field(index=True)
     amount: float
-    selected_numbers_json: str = Field(default_factory=lambda: "[]") # Stores JSON string of selected numbers
-    
-    # Game Results
-    matched_count: int = Field(default=0)
-    payout_multiplier: float = Field(default=0.0) # The final multiplier applied to the bet amount (e.g., 5.0)
-    payout_amount: float = Field(default=0.0)
+    selected_numbers: List[int] = Field(default=[], sa_column_kwargs={"type": json.loads})
+    matched_count: Optional[int] = Field(default=None)
+    payout_multiplier: Optional[float] = Field(default=None)
+    payout_amount: Optional[float] = Field(default=None)
     is_settled: bool = Field(default=False)
-    created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
+    bet_time: datetime = Field(default_factory=datetime.utcnow, nullable=False)
 
-    # Automatically converts JSON string to list of ints when reading
+    @model_validator(mode="before")
+    def validate_numbers(cls, values):
+        if isinstance(values.get('selected_numbers'), list):
+            values['selected_numbers'] = json.dumps(values['selected_numbers'])
+        return values
+    
     @property
     def selected_numbers(self) -> List[int]:
-        """Converts the stored JSON string back to a list of integers."""
-        return json.loads(self.selected_numbers_json)
-
-    @selected_numbers.setter
-    def selected_numbers(self, numbers: List[int]):
-        """Converts the list of integers to a JSON string for storage."""
-        self.selected_numbers_json = json.dumps(numbers)
+        return json.loads(self.sa_data.get("selected_numbers", "[]"))
 
 
-# --- Initialization Functions ---
-
-# Global variable to hold the engine instance
-engine: Optional[AsyncEngine] = None
+# --- Functions ---
 
 def init_db(database_url: str):
-    """Initializes the async database engine, ensuring the async driver is used."""
+    """Initializes the async database engine."""
     global engine
-    
-    # CRITICAL FIX: Ensure the database URL uses the async dialect (+asyncpg).
-    if database_url.startswith("postgresql://"):
-        async_database_url = database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
-    elif database_url.startswith("postgres://"):
-        async_database_url = database_url.replace("postgres://", "postgresql+asyncpg://", 1)
-    else:
-        async_database_url = database_url
-    
-    # Use the corrected URL to create the async engine
-    engine = create_async_engine(async_database_url, echo=False, pool_recycle=3600)
-    print("Database engine initialized with async driver.")
+    # CRITICAL FIX: Add connect_args for reliable connection pooling and concurrency
+    engine = AsyncEngine(
+        create_engine(
+            database_url, 
+            echo=False, 
+            pool_recycle=3600,
+            # Use connect_args to prevent unexpected closed connections during long idle times
+            connect_args={"server_settings": {"jit": "off"}} 
+        )
+    )
+    print("Database engine initialized.")
 
 async def create_db_and_tables():
     """Creates all tables defined in the SQLModel classes if they don't exist."""
     print("Attempting to create database tables...")
-    # NOTE: Using the global 'engine' directly here
     if engine:
         async with engine.begin() as conn:
             # Drop tables for fresh start (optional, comment out for production)
@@ -138,15 +108,16 @@ async def create_db_and_tables():
             await conn.run_sync(SQLModel.metadata.create_all)
             print("Database tables created successfully.")
     else:
+        # This message will only appear if init_db() was never called or failed silently
         print("Error: Database engine not initialized.")
 
 if __name__ == "__main__":
-    # Example of how to run the setup locally (requires DATABASE_URL to be set)
-    
+    import asyncio
+    import os
+    from dotenv import load_dotenv
+
     load_dotenv()
     db_url = os.environ.get("DATABASE_URL")
     if db_url:
         init_db(db_url)
         asyncio.run(create_db_and_tables())
-    else:
-        print("Please set the DATABASE_URL environment variable in your .env file.")
