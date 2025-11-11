@@ -2,19 +2,19 @@ from datetime import datetime
 from typing import List, Optional
 import json
 
-# --- FIX 1: Change import from sqlmodel.ext.asyncio.session ---
-# We no longer need the sync create_engine from sqlmodel.
+# Correct SQLAlchemy/SQLModel imports
 from sqlmodel import Field, SQLModel, Session 
-
-# --- FIX 2: Import the correct asynchronous engine creation function and type ---
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine 
-from sqlmodel.ext.asyncio.session import AsyncSession # Keep AsyncSession for session creation
+from sqlalchemy.orm import sessionmaker # NEW: Import for the factory
+from sqlmodel.ext.asyncio.session import AsyncSession # The session class itself
 
 # Global variable to hold the engine instance
-# The type is now correctly an AsyncEngine
 engine: Optional[AsyncEngine] = None 
 
-# --- Models (Ensuring they are present for reference) ---
+# NEW: Global variable to hold the session factory bound to the engine
+SessionLocal: Optional[sessionmaker] = None 
+
+# --- Models ---
 
 class User(SQLModel, table=True):
     """Stores user wallets and admin status."""
@@ -92,18 +92,27 @@ class Bet(SQLModel, table=True):
 # --- Initialization Functions ---
 
 def init_db(database_url: str):
-    """Initializes the async database engine using create_async_engine."""
-    global engine
+    """Initializes the async database engine and the session factory."""
+    global engine, SessionLocal
     try:
-        # FIX: Use create_async_engine (the correct async factory)
         engine = create_async_engine(
             database_url, 
             echo=False, 
+            future=True, 
             pool_recycle=3600,
-            # Use connect_args for stability in hosted environments
             connect_args={"server_settings": {"jit": "off"}} 
         )
-        print("Database engine initialized.")
+        
+        # CRITICAL FIX: Create the session factory bound to the engine
+        SessionLocal = sessionmaker(
+            bind=engine, 
+            class_=AsyncSession, 
+            expire_on_commit=False,
+            autoflush=False,
+            autocommit=False
+        )
+        
+        print("Database engine and session factory initialized.")
     except Exception as e:
         # Re-raise the exception to force the logs to show the root cause
         raise RuntimeError(f"FATAL: Failed to initialize DB engine. Check credentials/host in URL: {e}") from e
