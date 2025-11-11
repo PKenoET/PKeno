@@ -21,7 +21,7 @@ import httpx
 
 # Local imports
 # NOTE: Assumes db_setup.py has the fixed import: from sqlalchemy.ext.asyncio import AsyncEngine
-from db_setup import init_db, create_db_and_tables, engine, User, Transaction, KenoRound, Bet
+from db_setup import init_db, create_db_and_tables, engine, SessionLocal, User, Transaction, KenoRound, Bet
 
 # --- Configuration & Initialization ---
 
@@ -55,29 +55,29 @@ INITIALIZED_DB_URL: Optional[str] = None
 
 # --- Utility Functions ---
 
+# In main_app.py
+
 async def get_db_session() -> AsyncSession:
     """Dependency to get an async database session, with re-initialization logic."""
-    global engine # We need to access and potentially modify the global engine instance
+    global engine
     
-    if not engine:
-        # If engine is None, attempt to re-initialize using the stored, corrected URL
+    # CRITICAL FIX 1: Check if the SessionLocal factory is missing
+    if not engine or not SessionLocal: 
         if INITIALIZED_DB_URL:
-            logger.warning("DB engine is None, attempting re-initialization from within session getter...")
+            logger.warning("DB engine or SessionLocal missing, attempting re-initialization...")
             try:
-                # Attempt re-initialization in case of disconnection/dispose
-                init_db(INITIALIZED_DB_URL)
-                logger.info("DB engine successfully re-initialized.")
+                # init_db will now set BOTH engine and SessionLocal
+                init_db(INITIALIZED_DB_URL) 
+                logger.info("DB engine and factory successfully re-initialized.")
             except Exception as e:
-                # If re-initialization fails, raise the error to be caught by the game loop
                 raise RuntimeError(f"Database engine not initialized (Re-init failed): {e}") from e
         else:
-            # If we don't even have the URL, the main startup failed
             raise RuntimeError("Database engine not initialized. Check startup logs.")
             
-    # Now that 'engine' should be initialized (or an error was raised), proceed to session creation
-    async with AsyncSession(engine) as session:
+    # CRITICAL FIX 2: Instantiate the session from the bound factory
+    async with SessionLocal() as session:
         yield session
-
+        
 async def get_or_create_user(session: AsyncSession, tg_id: int, username: str) -> User:
     """Fetches or creates a user in the database."""
     statement = select(User).where(User.telegram_id == tg_id)
@@ -638,3 +638,4 @@ async def telegram_webhook(request: Request):
     except Exception as e:
         logger.error(f"Error processing webhook update: {e}", exc_info=True)
         return {"status": "error", "message": str(e)}
+
