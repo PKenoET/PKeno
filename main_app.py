@@ -59,22 +59,26 @@ INITIALIZED_DB_URL: Optional[str] = None
 
 async def get_db_session() -> AsyncSession:
     """Dependency to get an async database session, with re-initialization logic."""
-    global engine
     
-    # CRITICAL FIX 1: Check if the SessionLocal factory is missing
-    if not engine or not SessionLocal: 
+    # Check and attempt re-initialization if the factory is missing
+    if SessionLocal is None: 
         if INITIALIZED_DB_URL:
-            logger.warning("DB engine or SessionLocal missing, attempting re-initialization...")
+            logger.warning("DB SessionLocal factory is missing, attempting re-initialization...")
             try:
-                # init_db will now set BOTH engine and SessionLocal
+                # init_db will attempt to set both engine and SessionLocal globals
                 init_db(INITIALIZED_DB_URL) 
                 logger.info("DB engine and factory successfully re-initialized.")
             except Exception as e:
+                # If re-initialization fails, stop the request path with a clear error
                 raise RuntimeError(f"Database engine not initialized (Re-init failed): {e}") from e
-        else:
-            raise RuntimeError("Database engine not initialized. Check startup logs.")
-            
-    # CRITICAL FIX 2: Instantiate the session from the bound factory
+
+    # CRITICAL FIX: If SessionLocal is STILL None after initialization (or re-init), 
+    # raise a clear, non-NoneType error immediately.
+    if SessionLocal is None:
+        # This will be logged by the game loop's error handler.
+        raise RuntimeError("FATAL: Database SessionLocal factory failed to initialize and remains None.")
+
+    # Now we are guaranteed that SessionLocal is callable.
     async with SessionLocal() as session:
         yield session
         
@@ -638,4 +642,5 @@ async def telegram_webhook(request: Request):
     except Exception as e:
         logger.error(f"Error processing webhook update: {e}", exc_info=True)
         return {"status": "error", "message": str(e)}
+
 
