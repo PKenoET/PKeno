@@ -38,7 +38,7 @@ MIN_BET_AMOUNT = 5.0
 KENO_MAX_NUMBERS = 80
 KENO_DRAW_COUNT = 20
 KENO_MAX_PICKS = 10
-# 👑 Admin User ID Set to 441774500 (Corrected)
+# 👑 Admin User ID Set to 441774500
 ADMIN_ID = 441774500 
 
 # Logging
@@ -66,14 +66,12 @@ async def get_or_create_user(session: AsyncSession, tg_id: int, username: str) -
     user = result.first()
     
     if not user:
-        # Create a new user with default balances
         user = User(telegram_id=tg_id, username=username, vault_balance=0.0, playground_balance=0.0)
         session.add(user)
         await session.commit()
         await session.refresh(user)
         logger.info(f"New user created: {tg_id}")
 
-        # Make the defined ADMIN_ID an admin upon creation
         if tg_id == ADMIN_ID:
              user.is_admin = True
              session.add(user)
@@ -98,7 +96,7 @@ async def get_next_draw_time() -> datetime:
             return datetime.fromisoformat(draw_time_str) 
     return datetime.utcnow() + timedelta(seconds=GAME_INTERVAL_SECONDS)
 
-# --- Core Game Logic (Retained from original for simplicity) ---
+# --- Core Game Logic ---
 
 async def execute_keno_draw(session: AsyncSession, current_round_id: int) -> List[int]:
     """Simulates the Keno draw and saves the result."""
@@ -150,8 +148,6 @@ async def settle_all_bets(session: AsyncSession, round_id: int, winning_numbers:
 
         await session.commit()
         await session.refresh(user)
-        
-        # Send notification to user (simplified logic)
 
 async def start_new_round(session: AsyncSession, context: ContextTypes.DEFAULT_TYPE):
     """Sets up the next round and informs users."""
@@ -531,11 +527,18 @@ async def startup_event():
     if not DATABASE_URL:
         logger.error("FATAL: DATABASE_URL not set.")
         sys.exit(1)
+    
+    # CRITICAL FIX: Ensure the URL uses the asyncpg dialect before passing it to init_db
+    # This prevents errors if the environment variable is postgresql:// instead of postgresql+asyncpg://
+    db_url_with_dialect = DATABASE_URL
+    if db_url_with_dialect.startswith("postgresql://"):
+        db_url_with_dialect = db_url_with_dialect.replace("postgresql://", "postgresql+asyncpg://", 1)
         
     try:
-        init_db(DATABASE_URL)
+        init_db(db_url_with_dialect)
         logger.info("Database engine initialization successful.")
     except Exception as e:
+        # If this logs a specific connection error, the database credentials or host are wrong
         logger.error(f"FATAL: Database engine initialization failed: {e}", exc_info=True)
         # Halt startup if DB setup fails
         sys.exit(1) 
